@@ -8,6 +8,7 @@ use App\Models\AIModel;
 use Filament\Actions;
 use Filament\Notifications\Notification;
 use Filament\Resources\Pages\CreateRecord;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 
 class CreateChat extends CreateRecord
@@ -21,41 +22,78 @@ class CreateChat extends CreateRecord
         ray('Creando chat');
 
         try {
-            $client = app('openai');
 
-            $name = config('app.env') . '-' . $this->data['code'];
+            $model = AIModel::findOrFail($data['model_id']);
+            $provider = $model->provider;
+            $clientname = $model->name;
 
-            // Create an Vector Store
-            $response_vectorstore = $client->vectorStores()->create([
-                'name' => $name,
-            ]);
+            $data['user_id'] = auth()->id();
+            $data['provider'] = $provider;
+            $data['providername'] = $clientname;
 
-            ray($response_vectorstore);
+            if ($provider === 'openai') {
 
-            // Create an assistant
-            $response_assistant = $client->assistants()->create([
-                'name' => $name,
-                'tools' => [
-                    [
-                        'type' => 'file_search',
+                $client = app('openai');
+
+                $name = config('app.env') . '-' . $this->data['code'];
+
+                // Create an Vector Store
+                $response_vectorstore = $client->vectorStores()->create([
+                    'name' => $name,
+                ]);
+
+                ray($response_vectorstore);
+
+                // Create an assistant
+                $response_assistant = $client->assistants()->create([
+                    'name' => $name,
+                    'tools' => [
+                        [
+                            'type' => 'file_search',
+                        ],
                     ],
-                ],
-                'tool_resources' => [
-                    'file_search' => [
-                        'vector_store_ids' => [
-                            $response_vectorstore->id
-                        ]
+                    'tool_resources' => [
+                        'file_search' => [
+                            'vector_store_ids' => [
+                                $response_vectorstore->id
+                            ]
+                        ],
                     ],
-                ],
 
-                'model' => AIModel::find($data['model_id'])->name,
-            ]);
+                    'model' => $clientname,
+                ]);
 
-            ray($response_assistant);
+                ray($response_assistant);
 
-            $data['user_id']      = auth()->id();
-            $data['assistant_id'] = $response_assistant->id;
-            $data['vectorstore_id'] = $response_vectorstore->id;
+                //$data['user_id']      = auth()->id();
+                $data['assistant_id'] = $response_assistant->id;
+                $data['vectorstore_id'] = $response_vectorstore->id;
+            } elseif ($provider === 'anthropic') {
+
+                $response = Http::withHeaders([
+                    'x-api-key' => config('anthropic.key'),
+                    'anthropic-version' => '2023-06-01',
+                    'Content-Type' => 'application/json',
+                ])->post('https://api.anthropic.com/v1/messages', [
+                    'model' => $clientname,
+                    'max_tokens' => 1000,
+                    'messages' => [
+                        [
+                            'role' => 'user',
+                            'content' => 'Inicializar conversación para ' . $this->data['code'],
+                        ],
+                    ],
+                ]);
+
+                if ($response->successful()) {
+                    $data['assistant_id'] = null;
+                } else {
+                    throw new \Exception('Error en la llamada a la API de Anthropic: ' . $response->body());
+                }
+
+                // Anthropic no usa vectorstore
+                $data['vectorstore_id'] = null;
+            }
 
         } catch (\Exception $e) {
             ray($e->getMessage());
@@ -76,7 +114,5 @@ class CreateChat extends CreateRecord
         return $data;
 
     }
-
-
 
 }

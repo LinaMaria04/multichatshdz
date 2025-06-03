@@ -11,4 +11,6 @@ class AIModel extends Model
 
     protected $table = 'ai_models';
 
+    protected $fillable = ['name', 'description', 'provider'];
+
 }

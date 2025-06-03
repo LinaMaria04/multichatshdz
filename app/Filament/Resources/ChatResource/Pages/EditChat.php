@@ -26,26 +26,31 @@ class EditChat extends EditRecord
 
                     $chat->files()->delete();
 
-                    $client = app('openai');
+                     if ($chat->provider === 'openai') {
+                        $client = app('openai');
 
-                    // Get all the files of this Chat
-                    $response = $client->vectorStores()->files()->list(
-                        vectorStoreId: $chat->vectorstore_id,
-                    );
+                        $vectorStoreId = $chat->vectorstore_id ?? null;
 
-                    // Delete all the files
-                    foreach ($response->data as $file) {
-                        $client->files()->delete( $file->id );
-                    }
+                        // Get all the files of this Chat
+                        $response = $client->vectorStores()->files()->list(
+                            vectorStoreId: $chat->vectorstore_id,
+                        );
 
-                    // Delete the VectorStore
-                    $client->vectorStores()->delete(
-                        vectorStoreId: $chat->vectorstore_id
-                    );
+                        // Delete all the files
+                        foreach ($response->data as $file) {
+                            $client->files()->delete( $file->id );
+                        }
 
-                    // Delete the Assistant
-                    $client->assistants()->delete( $chat->assistant_id );
+                        // Delete the VectorStore
+                        $client->vectorStores()->delete(
+                            vectorStoreId: $chat->vectorstore_id
+                        );
 
+                        // Delete the Assistant
+                        $client->assistants()->delete( $chat->assistant_id );
+                    } else if($chat->provider === 'anthropic') {
+                        
+                    }   
                 }),
         ];
     }

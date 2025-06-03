@@ -130,6 +130,7 @@ class ChatResource extends Resource
     {
         return [
             RelationManagers\FilesRelationManager::class,
+            RelationManagers\ImageRelationManager::class,
         ];
     }
 

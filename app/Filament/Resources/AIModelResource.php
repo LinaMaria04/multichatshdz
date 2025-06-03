@@ -10,6 +10,7 @@ use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Filament\Forms\Components\Select;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 
@@ -29,6 +30,12 @@ class AIModelResource extends Resource
                 Forms\Components\TextInput::make('description')
                     ->required()
                     ->maxLength(255),
+                Select::make('provider')
+                    ->options([
+                        'openai' => 'openai',
+                        'anthropic' => 'anthropic',
+                    ])
+                    ->required(),    
             ]);
     }
 
@@ -38,6 +45,8 @@ class AIModelResource extends Resource
             ->columns([
                 Tables\Columns\TextColumn::make('name')
                     ->searchable(),
+                Tables\Columns\TextColumn::make('provider') //Campo en el index para mostrar el proveedor
+                    ->searchable(),     
                 Tables\Columns\TextColumn::make('description')
                     ->searchable(),
                 Tables\Columns\TextColumn::make('created_at')

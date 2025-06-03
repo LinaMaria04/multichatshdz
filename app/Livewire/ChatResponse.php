@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Livewire\Component;
+use Illuminate\Support\Facades\Http;
 
 class ChatResponse extends Component
 {
@@ -22,7 +23,8 @@ class ChatResponse extends Component
 
     public ?string $response = null;
 
-    public string $assistant_id;
+    //public string $assistant_id;
+    public ?string $assistant_id = null;
 
     public string $log_ip = '';
 
@@ -32,9 +34,15 @@ class ChatResponse extends Component
 
     public string $user_agent = '';
 
+    public string $provider;
+
+    public string $providername;
+
+    public $assistantReply;
+
     public ?string $tts_error = null;
 
-    public function mount(string $assistant_id, string $code, Request $request, bool $tts_voice = false)
+    public function mount(?string $assistant_id, string $code, string $provider, string $providername, Request $request, bool $tts_voice = false)
     {
         $this->tts_voice = $tts_voice;
         ray('ChatResponse::mount', $assistant_id)->green();
@@ -47,6 +55,8 @@ class ChatResponse extends Component
         $this->user_agent = $request->userAgent();
 
         $this->code = $code;
+
+        $this->provider = $provider;
 
         $this->js('$wire.getResponse()');
     }
@@ -75,44 +85,80 @@ class ChatResponse extends Component
         // Reindexar el array para que las claves sean consecutivas
         $filteredArray = array_values($filteredArray);
 
+        //Procesar mensajes incluyendo textos e imagenes
+        $enhancedMessages = [];
+
+        foreach ($filteredArray as $message) {
+            $newMessage = [
+                'role' => $message['role'],
+                'content' => [],
+            ];
+
+            // Texto
+            if (!empty($message['content'])) {
+                $newMessage['content'][] = [
+                    'type' => 'text',
+                    'text' => $message['content'],
+                ];
+            }
+
+            // Imagen
+            if (!empty($message['path'])) {
+                $imagePath = asset('storage/' . $message['path']);
+                if (file_exists($imagePath)) {
+                    $imageData = base64_encode(file_get_contents($imagePath));
+                    $mimeType = mime_content_type($imagePath);
+                    $newMessage['content'][] = [
+                        'type' => 'image_url',
+                        'image_url' => [
+                            'url' => "data:{$mimeType};base64,{$imageData}",
+                        ],
+                    ];
+                }
+            }
+
+            $enhancedMessages[] = $newMessage;
+        }
+
         try {
-            $stream = app('openai')->threads()->createAndRunStreamed(
-                [
-                    'assistant_id' => $this->assistant_id,
-                    'instructions' => $instructions,
-                    'thread' => [
-                        'messages' => $filteredArray
+            if ($this->provider === 'openai') {
+                $stream = app('openai')->threads()->createAndRunStreamed(
+                    [
+                        'assistant_id' => $this->assistant_id,
+                        'instructions' => $instructions,
+                        'thread' => [
+                            'messages' => $enhancedMessages
+                        ],
+                        'max_completion_tokens' => 400,
                     ],
-                    'max_completion_tokens' => 600,
-                ],
-            );
-
-
-            $content = '';
-            foreach ($stream as $response) {
-
-                ray($response->event);
-
-                if ($response->event === 'thread.run.failed') {
-                    $content = 'Tenemos problemas técnicos, vuelve a hacer tu pregunta en unos segundos';
-
-                    $this->response = $content;
-                }
-
-                if ($response->event === 'thread.message.delta') {
-
-                    $content = Arr::get($response->response->delta->content[0]->toArray(), 'text.value');
-
-                    $this->response .= $content;
-                }
-
-                $this->stream(
-                    to: 'stream-' . $this->getId(),
-                    content: $content,
-                    replace: false
                 );
 
-            }
+
+                $content = '';
+                foreach ($stream as $response) {
+
+                    ray($response->event);
+
+                    if ($response->event === 'thread.run.failed') {
+                        $content = 'Tenemos problemas técnicos, vuelve a hacer tu pregunta en unos segundos';
+
+                        $this->response = $content;
+                    }
+
+                    if ($response->event === 'thread.message.delta') {
+
+                        $content = Arr::get($response->response->delta->content[0]->toArray(), 'text.value');
+
+                        $this->response .= $content;
+                    }
+
+                    $this->stream(
+                        to: 'stream-' . $this->getId(),
+                        content: $content,
+                        replace: false
+                    );
+
+                }
 
             // Dispatch event to signal text generation is complete
             $this->dispatch('typingFinished');
@@ -154,6 +200,40 @@ class ChatResponse extends Component
                     // $this->dispatch('tts-error', message: 'Error al generar el audio.');
                 }
             }
+        } elseif ($this->provider === 'anthropic'){
+
+                $userTextBlocks = [];
+
+                foreach ($enhancedMessages as $message) {
+                    $textContent = '';
+                    foreach ($message['content'] as $part) {
+                        if ($part['type'] === 'text') {
+                            $textContent .= $part['text'] . "\n";
+                        } elseif ($part['type'] === 'image_url') {
+                            $textContent .= '[Imagen adjunta]' . "\n"; 
+                        }
+                    }
+
+                    $userTextBlocks[] = $textContent;
+                }
+
+                $promptUser = implode("\nHuman: ", $userTextBlocks);
+                $promptAnthropic = "Human: " . $promptUser . "\nAssistant:";
+
+                // Realizamos la llamada a la API de Anthropic
+                $response = Http::withHeaders([
+                    'x-api-key' => config('anthropic.key'),
+                    'anthropic-version' => '2023-06-01',
+                    'Content-Type' => 'application/json',
+                ])->post('https://api.anthropic.com/v1/complete', [
+                    'model' => $this->providername, 
+                    'prompt' => $promptAnthropic,
+                    'max_tokens_to_sample' => 400,
+                    'temperature' => 0.7,
+            ]);
+
+            $this->response = $response['completion'] ?? 'Sin respuesta.';
+            }    
 
         } catch (\Exception $e) {
             Log::error('Error OpenAI API call', ['error' => $e->getMessage()]);

@@ -9,6 +9,20 @@ class Chat extends Model
 {
     use HasFactory;
 
+    protected $fillable = [
+        'code',    
+        'name',
+        'prompt',
+        'user_id',
+        'assistant_id',
+        'vectorstore_id',
+        'agent_id',
+        'model_id',
+        'header',
+        'provider',
+        'providername',
+    ];
+
     protected $casts = [
         'last_fetch_execution' => 'datetime',
     ];
@@ -21,6 +35,11 @@ class Chat extends Model
     public function files()
     {
         return $this->hasMany(Files::class);
+    }
+
+    public function imagen()
+    {
+        return $this->hasMany(imagen::class);
     }
 
     public function agent()
