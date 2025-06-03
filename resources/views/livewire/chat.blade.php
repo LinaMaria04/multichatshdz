@@ -33,11 +33,50 @@
                     </div>
                 @endif
                 @if ($message['role'] === 'assistant')
-                    <livewire:chat-response :key="$key" :messages="$messages" :prompt="$messages[$key - 1]" :assistant_id="$assistant_id" :code="$code" :tts_voice="$tts_voice"/>
+                    <livewire:chat-response
+                     :key="$key"
+                     :messages="$messages"
+                     :prompt="$messages[$key > 0 ? $key - 1 : 0]" 
+                     :assistant_id="$assistant_id" 
+                     :code="$code" 
+                     :provider="$provider"
+                     :providername="$providername"
+                     :assistantReply="$message['content']"
+                     :tts_voice="$tts_voice"/>
                 @endif
             @endforeach
         </div>
     </div>
+
+    {{-- Mostrar fórmula SI EXISTE (fuera del bucle de mensajes) --}}
+    @if ($formula)
+        <div id="formulaContainer" style="margin-bottom: 10px;">
+            <div class="math">\({!! $formula !!}\)</div>
+            <div>
+                <button type="button" wire:click="usarFormula" 
+                    style="display: block; background-color: #FFA500; color: #4b0082; padding: 10px 15px; border: none; border-radius: 5px; margin-top: 10px; cursor: pointer;">
+                    Usar esta fórmula
+                </button>
+            </div>
+        </div>
+    @endif
+
+    {{-- Formulario para ingresar variables --}}
+    @if ($usarFormula)
+        <form wire:submit.prevent="calcularFormula" class="my-4 p-3 bg-orange-50 border border-orange-300 rounded space-y-3">
+            <div class="font-semibold mb-2">Ingresa los valores para las variables:</div>
+
+            @foreach($variables as $var => $value)
+                <div>
+                    <label for="{{ $var }}" class="block font-medium">{{ $var }}:</label>
+                    <input type="number" step="any" wire:model.defer="variables.{{ $var }}" id="{{ $var }}"
+                        class="border rounded px-2 py-1 w-full" required>
+                </div>
+            @endforeach
+
+            <button type = "submit" style="display: block; background-color: #FFA500; color: #4b0082; padding: 10px 15px; border: none; border-radius: 5px; margin-top: 10px; cursor: pointer;"> Calcular </button>
+        </form>
+    @endif
 
     <!-- Input fijo -->
     <div class="flex-shrink-0 pt-3 border-t border-slate-200">
@@ -180,4 +219,34 @@
         }
     });
 </script>
+<script>
+   document.addEventListener("DOMContentLoaded", function () {
+        if (window.Livewire) {
+            Livewire.on("formulaActualizada", () => {
+                setTimeout(() => {
+                    const formulaDiv = document.getElementById("formulaContainer");
+                    if (window.MathJax && formulaDiv) {
+                        //.typeset([formulaDiv]); // Procesar solo ese contenedor
+                        MathJax.typesetPromise([formulaDiv]);
+                    } else {
+                        console.error("MathJax o el div de la fórmula no están disponibles.");
+                    }
+                }, 300);
+            });
+            Livewire.on("usarFormula", () => {
+                    console.log("Evento usarFormula recibido correctamente.");
+                });
+
+        } else {
+            console.error("Livewire no está definido en el frontend.");
+        }
+    });
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+<script id="MathJax-script" async
+        src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+</script>
+
 @endpush

@@ -27,6 +27,7 @@ class CreateChat extends CreateRecord
             $provider = $model->provider;
             $clientname = $model->name;
 
+           
             $data['user_id'] = auth()->id();
             $data['provider'] = $provider;
             $data['providername'] = $clientname;
@@ -35,18 +36,16 @@ class CreateChat extends CreateRecord
 
                 $client = app('openai');
 
-                $name = config('app.env') . '-' . $this->data['code'];
-
                 // Create an Vector Store
                 $response_vectorstore = $client->vectorStores()->create([
-                    'name' => $name,
+                    'name' => 'eim-' . $this->data['code'],
                 ]);
 
-                ray($response_vectorstore);
-
+                $vectorstore_id = $response_vectorstore->id;
+                //ray($response_vectorstore);
                 // Create an assistant
                 $response_assistant = $client->assistants()->create([
-                    'name' => $name,
+                    'name' => 'eim-' . $this->data['code'],
                     'tools' => [
                         [
                             'type' => 'file_search',
@@ -55,7 +54,7 @@ class CreateChat extends CreateRecord
                     'tool_resources' => [
                         'file_search' => [
                             'vector_store_ids' => [
-                                $response_vectorstore->id
+                                $vectorstore_id,
                             ]
                         ],
                     ],
@@ -63,11 +62,11 @@ class CreateChat extends CreateRecord
                     'model' => $clientname,
                 ]);
 
-                ray($response_assistant);
+                //ray($response_assistant);
 
                 //$data['user_id']      = auth()->id();
                 $data['assistant_id'] = $response_assistant->id;
-                $data['vectorstore_id'] = $response_vectorstore->id;
+                $data['vectorstore_id'] = $vectorstore_id;
             } elseif ($provider === 'anthropic') {
 
                 $response = Http::withHeaders([

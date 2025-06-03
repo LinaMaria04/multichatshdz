@@ -64,7 +64,7 @@ class Chat extends Component
 
         $this->header = $chat->header;
 
-        $this->assistant_id = $chat->assistant_id;
+        $this->assistant_id = $chat->assistant_id ?? '';
 
         $this->agent = $chat->agent;
 
@@ -149,7 +149,7 @@ class Chat extends Component
                 ]);
                 $assistantReply = $response->choices[0]->message->content ?? '';
 
-                 $this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
+                 //$this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
 
             } elseif ($this->provider === 'anthropic') {
 
@@ -239,7 +239,7 @@ class Chat extends Component
                     $assistantReply = $json['completion'] ?? ($json['choices'][0]['message']['content'] ?? '');
                 }
             }
-            array_pop($this->messages);
+            //array_pop($this->messages); Eliminar el último mensaje del usuario para no repetirlo
 
 
             $this->formula = $this->extraerFormulaLatex($assistantReply);

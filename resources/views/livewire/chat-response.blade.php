@@ -12,9 +12,10 @@
         {{-- Stream container --}}
         <div wire:stream="stream-{{ $this->getId() }}" class="stream">
             {{-- Add a wrapper with stream-content class only if $response is not empty --}}
-            @if(!empty($response))
+           {{--@if(!empty($response))--}}
+           @if(!empty($assistantReply))
             <span class="stream-content">
-                <x-markdown>{!! $response !!}</x-markdown>
+                <x-markdown>{!! $assistantReply !!}</x-markdown>
             </span>
             @endif
         </div>
