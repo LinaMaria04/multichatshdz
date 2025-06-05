@@ -3,11 +3,16 @@
 namespace App\Livewire;
 
 use App\Models\Log;
+use App\Models\Chat as ChatModel;
+use App\Models\DatabaseConnection;
+use App\Services\DatabaseConnector;
 use Illuminate\Http\Request;
 use Livewire\Attributes\Validate;
 use Livewire\Component;
 use Illuminate\Support\Facades\Http;
 use Smalot\PdfParser\Parser;
+use Illuminate\Support\Facades\Log as LogFacade;
+use OpenAI\Laravel\Facades\OpenAI;
 
 class Chat extends Component
 {
@@ -54,11 +59,13 @@ class Chat extends Component
     public ?string $formtemp = null;
     public array $variables = [];
 
+    public $dbConnections = null;
+
     public function mount(string $code = null, Request $request)
     {
         $chat = \App\Models\Chat::where('code', $code)->firstOrFail();
 
-        \Log::info('Chat data', $chat->toArray());
+        LogFacade::info('Chat data', $chat->toArray());
 
         $this->code = $code;
 
@@ -84,6 +91,11 @@ class Chat extends Component
         $this->rutaArchivo = $archivo ? $archivo['filename'] : null;
 
         $this->comportamiento = $chat->prompt;
+
+        //Cargar las conexiones de bases de datos asocidas al chat
+        $this->dbConnections = $chat->databaseConnection;
+        
+        LogFacade::info('DB Connections loaded', $this->dbConnections->toArray());
     }
 
     public function extraerTextoPDF($rutaArchivo){
@@ -109,18 +121,21 @@ class Chat extends Component
             'timestamp' => now()
         ]);
 
-        //$this->messages[] = ['role' => 'user', 'content' => $this->body];
-        //$this->messages[] = ['role' => 'assistant', 'content' => ''];
-        //$this->is_typing = true;
-
-        //$this->body = '';
-
-         $currentUserMessage = $this->body;
+        $currentUserMessage = $this->body;
+        $this->messages[] = ['role' => 'user', 'content' => $currentUserMessage]; //Revisar si funciona con todas las posibilidades de chats
         $this->body = '';
+        $this->is_typing = true; //Activa el indicador de escribiendo
 
         try {
             $assistantReply = '';
 
+            //Procesar preguntas al usuario con la base de datos
+            $dbResponse = $this->handleDatabaseQuery($currentUserMessage);
+            //Si hay una respuesta de la base de datos, utilizarla como respuesta del chat
+            if($dbResponse !== null){
+                $assistantReply = $dbResponse;
+                $this->is_typing = true;
+            } else {
              // Si hay un PDF para enviar y usar
             if ($this->rutaArchivo && empty($this->messages)) {
                 $textoPDF = $this->extraerTextoPDF(storage_path('app/public/' . $this->rutaArchivo  ));
@@ -132,7 +147,7 @@ class Chat extends Component
 
             }
 
-            $this->messages[] = ['role' => 'user', 'content' => $currentUserMessage];
+            //$this->messages[] = ['role' => 'user', 'content' => $currentUserMessage];
 
             if ($this->provider === 'openai') {
 
@@ -149,7 +164,7 @@ class Chat extends Component
                 ]);
                 $assistantReply = $response->choices[0]->message->content ?? '';
 
-                 //$this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
+                 $this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
 
             } elseif ($this->provider === 'anthropic') {
 
@@ -215,7 +230,7 @@ class Chat extends Component
                     ]);
 
                     $json = $response->json();
-                    \Log::info('Anthropic response:', $json);
+                    LogFacade::info('Anthropic response:', $json);
 
                     $assistantReply = $json['content'][0]['text'] ?? 'Sin respuesta.';
                     
@@ -234,11 +249,12 @@ class Chat extends Component
                     ]);
 
                     $json = $response->json();
-                    \Log::info('Respuesta Anthropic completa:', $json);
+                    LogFacade::info('Respuesta Anthropic completa:', $json);
 
                     $assistantReply = $json['completion'] ?? ($json['choices'][0]['message']['content'] ?? '');
                 }
             }
+        }
             //array_pop($this->messages); Eliminar el último mensaje del usuario para no repetirlo
 
 
@@ -267,13 +283,269 @@ class Chat extends Component
 
 
         } catch (\Exception $e) {
-            \Log::error('Error en chat send(): ' . $e->getMessage());
+            LogFacade::error('Error en chat send(): ' . $e->getMessage());
 
             array_pop($this->messages);
             $this->messages[] = ['role' => 'assistant', 'content' => 'Se ha producido un error al procesar tu consulta. Inténtalo más tarde.'];
         }
 
     }
+
+    //Metodo para responder las preguntas del usuario con la base de datos
+    private function handleDatabaseQuery(string $userMessage): ?string
+    {
+        //Verificar si hay una bd asociada al chat
+        if ($this->dbConnections->isEmpty()) {
+            return null;
+        }
+
+        foreach ($this->dbConnections as $dbConnection) {
+            if ($dbConnection->tipo_conector !== 'mysql') { // Si NO es 'mysql', salta a la siguiente
+                LogFacade::info("Saltando conexión DB ID {$dbConnection->id} por tipo de conector no soportado: {$dbConnection->tipo_conector}");
+                continue;
+            }
+
+            try {
+                $connector = new DatabaseConnector(); 
+                $schema = $connector->getSchema($dbConnection);
+
+                //dd($schema); 
+                if (empty($schema)) {
+                    LogFacade::warning(("No se pudo obtener el esquema para la conexión de la base de datos: " . $dbConnection->id));
+                    continue; // Intenta seguir con la siguiente conexión en dado caso de que hayan varias
+                }
+
+                $schemaString = $this->formatSchemaForLLM($schema);
+
+                $promptForSQL = "Eres un asistente de IA experto en SQL. Tu tarea es generar la consulta SQL más adecuada para responder a la pregunta del usuario, basándote *únicamente* en el esquema de base de datos proporcionado. 
+                Las tablas disponibles son: {$schemaString}.
+                Genera una consulta SQL (SOLO la consulta, sin ningún texto, explicaciones, markdown, ni comentarios adicionales) para responder a la siguiente pregunta del usuario: '{$userMessage}'
+                Ejemplo de salida esperada: SELECT * FROM users;";
+
+                $sqlQuery = '';
+                $modelToUse = $this->providername;
+
+                if ($this->provider === 'openai') { 
+                    $sqlLlmResponse = app('openai')->chat()->create([
+                        'model' => $modelToUse,
+                        'messages' => [
+                            ['role' => 'system', 'content' => $promptForSQL],
+                            ['role' => 'user', 'content' => $userMessage],
+                        ],
+                        'max_tokens' => 200,
+                        'temperature' => 0.1,
+                    ]);
+                    $sqlQuery = $sqlLlmResponse->choices[0]->message->content ?? '';
+                } elseif ($this->provider === 'anthropic') {
+                    $response = Http::withHeaders([
+                        'x-api-key' => config('anthropic.key'),
+                        'anthropic-version' => '2023-06-01',
+                        'Content-Type' => 'application/json',
+                    ])->post('https://api.anthropic.com/v1/messages', [
+                        'model' => $modelToUse,
+                        'system' => "Eres un experto en SQL que genera consultas SELECT para MySQL basadas en un esquema de base de datos. Responde solo con la consulta SQL.",
+                        'messages' => [
+                            ['role' => 'user', 'content' => $promptForSQL . "\n\nPregunta del usuario: " . $userMessage],
+                        ],
+                        'max_tokens' => 200,
+                        'temperature' => 0.1,
+                    ]);
+
+                    if ($response->successful()) {
+                        $anthropicResponse = $response->json();
+                        $sqlQuery = $anthropicResponse['content'][0]['text'] ?? '';
+                    } else {
+                        LogFacade::error("Error en la llamada a la API de Anthropic (SQL): " . $response->body());
+                        return null; 
+                    }
+                } else {
+                    LogFacade::warning("Proveedor LLM no soportado: {$this->provider}");
+                    return null;
+                }
+
+                // Limpieza de la consulta SQL generada por el LLM
+                if (str_starts_with(trim($sqlQuery), '```sql')) {
+                    $sqlQuery = trim(str_replace(['```sql', '```'], '', $sqlQuery));
+                }
+                $sqlQuery = trim($sqlQuery);
+
+                if (!empty($sqlQuery) && $this->isValidSql($sqlQuery)) {
+                    LogFacade::info("SQL generado por LLM: {$sqlQuery}");
+                    $dbResults = $connector->executeQuery($dbConnection, $sqlQuery);
+
+                    LogFacade::info("Resultados de la DB (raw): " . json_encode($dbResults));
+
+                    if (empty($dbResults)) {
+                        LogFacade::warning("La consulta SQL no arrojó resultados para la pregunta '{$userMessage}'. SQL: '{$sqlQuery}'");
+                        return null;
+                    }
+
+                    $resultsString = json_encode($dbResults);
+
+                    $extractedValue = null;
+                    if (is_array($dbResults) && !empty($dbResults)) {
+                        foreach ($dbResults as $row) {
+                            if (is_array($row)) {
+                                foreach ($row as $key => $value) {
+                                    // Busca un valor numérico, idealmente el primero encontrado
+                                    if (is_numeric($value)) {
+                                        $extractedValue = $value;
+                                        break 2; // Salir de ambos bucles
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    $openaiPromptForResponse = "";
+                    $anthropicPromptForResponse = "";
+
+                    if ($extractedValue !== null) {
+                        $openaiPromptForResponse = "El usuario preguntó: '{$userMessage}'. La respuesta a esta pregunta, basada en la consulta SQL ('{$sqlQuery}') ejecutada en la base de datos, es el número: {$extractedValue}. Por favor, genera una respuesta amigable y concisa para el usuario, utilizando **únicamente** este número {$extractedValue} para contestar la pregunta original. No menciones la base de datos, las consultas SQL, ni que no tienes acceso a la BD. Simplemente da la respuesta al usuario.";
+
+                        $anthropicPromptForResponse = "La pregunta del usuario es: '{$userMessage}'. El resultado numérico de la base de datos es: {$extractedValue}. Responde la pregunta del usuario de forma amigable y concisa utilizando este número. No menciones bases de datos ni consultas SQL.";
+                    } else {
+                        $openaiPromptForResponse = "El usuario preguntó: '{$userMessage}'. Los resultados de la base de datos obtenidos fueron: {$resultsString}. Genera una respuesta amigable y concisa para el usuario, basándote en estos resultados. Si no puedes extraer un número claro, explica lo que los resultados indican sin mencionar que no tienes acceso a la BD.";
+                        $anthropicPromptForResponse = "La pregunta del usuario es: '{$userMessage}'. Los resultados de la base de datos obtenidos son: {$resultsString}. Responde la pregunta de forma amigable y concisa basándote en estos resultados.";
+                    }
+
+                    //Limpieza adicional del prompt para Anthropic (se aplica a la cadena final)
+                    $anthropicPromptForResponse = mb_convert_encoding($anthropicPromptForResponse, 'UTF-8', 'UTF-8');
+                    $anthropicPromptForResponse = preg_replace('/[[:cntrl:]]/', '', $anthropicPromptForResponse);
+                    $anthropicPromptForResponse = trim($anthropicPromptForResponse);
+
+                    if (empty($anthropicPromptForResponse)) {
+                        LogFacade::error("El prompt para Anthropic quedó vacío después de la limpieza. Revisa los caracteres en la cadena.");
+                        return null; 
+                    }
+
+                    $finalLlmResponseContent = '';
+                    
+                    if ($this->provider === 'openai') {
+                        $finalLlmResponse = app('openai')->chat()->create([
+                            'model' => $modelToUse,
+                            'messages' => [
+                                ['role' => 'system', 'content' => $openaiPromptForResponse],
+                                ['role' => 'user', 'content' => $userMessage],
+                            ],
+                            'temperature' => 0.5,
+                        ]);
+                        $finalLlmResponseContent = $finalLlmResponse->choices[0]->message->content ?? '';
+
+                    } elseif ($this->provider === 'anthropic') {
+
+                        $systemPromptAnthropicFinal = "Eres un asistente que responde preguntas de forma concisa y directa, utilizando la información proporcionada. NO inventes información ni menciones que no tienes acceso a la base de datos. Enfócate en responder con el dato que te doy.";
+                        $systemPromptAnthropicFinal = mb_convert_encoding($systemPromptAnthropicFinal, 'UTF-8', 'UTF-8');
+                        $systemPromptAnthropicFinal = preg_replace('/[[:cntrl:]]/', '', $systemPromptAnthropicFinal);
+                        $systemPromptAnthropicFinal = trim($systemPromptAnthropicFinal);
+
+                        // Este es el PAYLOAD FINAL que se enviará a Anthropic
+                        $finalPayloadAnthropic = [
+                            'model' => $modelToUse,
+                            'system' => $systemPromptAnthropicFinal, // Usa el system prompt limpio y específico
+                            'messages' => [
+                                ['role' => 'user', 'content' => $anthropicPromptForResponse], // Usa el prompt de usuario limpio
+                            ],
+                            'max_tokens' => 500,
+                            'temperature' => 0.7,
+                        ];
+
+                        // dd($finalPayloadAnthropic);
+
+                        LogFacade::info("Payload Final Anthropic: " . json_encode($finalPayloadAnthropic)); 
+
+                        $response = Http::withHeaders([
+                            'x-api-key' => config('anthropic.key'),
+                            'anthropic-version' => '2023-06-01',
+                            'Content-Type' => 'application/json',
+                        ])->post('https://api.anthropic.com/v1/messages', $finalPayloadAnthropic); 
+
+                        if ($response->successful()) {
+                            $anthropicResponse = $response->json();
+                            $finalLlmResponseContent = $anthropicResponse['content'][0]['text'] ?? '';
+                        } else {
+                            LogFacade::error("Error en la llamada a la API de Anthropic (Respuesta Final): " . $response->body());
+                            return null;
+                        }
+                    }
+                    
+
+                    if (!empty($finalLlmResponseContent)) {
+                        LogFacade::info("Respuesta Final de LLM: {$finalLlmResponseContent}");
+                        return $finalLlmResponseContent;
+                    }
+
+                    return null;
+
+                } else {
+                    LogFacade::warning("LLM generó SQL inválido o no generó SQL para la pregunta: '{$userMessage}'. SQL generado: '{$sqlQuery}'");
+                    return null;
+                }
+            } catch (\Exception $e) {
+                LogFacade::error("Error en el procesamiento de DB para la pregunta '{$userMessage}': " . $e->getMessage());
+
+                return null;
+            }
+        }
+        return null; // Si no se pudo responder con ninguna conexión de BD
+    }
+
+    private function formatSchemaForLLM(array $schema): string{
+
+        $formattedSchema = "";
+
+        foreach ($schema as $item){
+            //dd($item);
+            if(is_array($item) && isset($item['name']) && isset($item['columns'])) {
+                //dd($item);
+                $tableName = $item['name'];
+                $columnsData  = $item['columns'];
+                //dd($tableName);
+                $formattedSchema .= "Tabla: {$tableName}\n";
+                $formattedSchema .= "Columnas:\n";
+
+                if (is_array($columnsData)) { // Asegurarse de que $columnsData es un array
+                    foreach ($columnsData as $column) {
+                        // Asegúrate de que cada $column sea un array y contenga la clave 'name'
+                        if (is_array($column) && isset($column['name'])) {
+                            $columnType = $column['type'] ?? 'VARCHAR'; // Asume VARCHAR si no hay tipo
+                            $formattedSchema .= "  - {$column['name']} ({$columnType})\n";
+                        }
+                    }
+                }
+                $formattedSchema .= "\n";
+            }
+        }
+        return $formattedSchema;
+    }
+
+    private function isValidSql(string $sql): bool{
+        // Convertir la consulta a minúsculas para una comparación insensible a mayúsculas/minúsculas
+        $lowerSql = strtolower(trim($sql));
+
+        if (!preg_match('/^select\b/', $lowerSql)) {
+            LogFacade::warning("SQL inválido: no es una consulta SELECT. Consulta: {$sql}");
+            return false;
+        }
+
+        // Palabras clave que no deben estar presentes (operaciones de escritura)
+        $forbiddenKeywords = [
+            'insert into', 'update', 'delete from', 'drop table', 'alter table',
+            'create table', 'truncate table', 'union all', // Considerar 'union all' si no quieres que el LLM combine resultados de tablas no relacionadas
+            'grant', 'revoke', 'flush', 'set password', 'load data', 'into outfile'
+        ];
+
+        foreach ($forbiddenKeywords as $keyword) {
+            if (str_contains($lowerSql, $keyword)) {
+                LogFacade::warning("SQL inválido: contiene palabra clave prohibida ('{$keyword}'). Consulta: {$sql}");
+                return false;
+            }
+        }
+
+        return true; // Si pasa todas las validaciones, es válido.
+    }
+
+    
 
     private function extraerFormulaLatex(string $texto): ?string {
 
@@ -392,8 +664,8 @@ class Chat extends Component
                         $this->dispatch('formulaActualizada');
 
         } catch (\Exception $e) {
-            \Log::error('Error al calcular la fórmula con IA: ' . $e->getMessage());
-            $this->messages[] = ['role' => 'assistant', 'content' => 'Ocurrió un error al procesar la fórmula.'];
+            LogFacade::error('Error al calcular la fórmula con IA: ' . $e->getMessage());
+           $this->messages[] = ['role' => 'assistant', 'content' => 'Ocurrió un error al procesar la fórmula.'];
         }
     }
 

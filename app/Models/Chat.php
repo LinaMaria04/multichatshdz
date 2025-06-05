@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use App\Models\DatabaseConnection;
 
 class Chat extends Model
 {
@@ -40,6 +41,11 @@ class Chat extends Model
     public function imagen()
     {
         return $this->hasMany(imagen::class);
+    }
+
+    public function databaseConnection()
+    {
+        return $this->hasMany(DatabaseConnection::class);
     }
 
     public function agent()

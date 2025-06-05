@@ -8,6 +8,7 @@
         "php": "^8.2",
         "barryvdh/laravel-debugbar": "^3.13",
         "defstudio/filament-column-length-limiter": "^1.0",
+        "doctrine/dbal": "^4.2",
         "filament/filament": "^3.2",
         "joaopaulolndev/filament-edit-profile": "^1.0",
         "laravel/framework": "^11.9",
