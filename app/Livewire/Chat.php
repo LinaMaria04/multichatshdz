@@ -61,6 +61,8 @@ class Chat extends Component
 
     public $dbConnections = null;
 
+    public $tipodearchivo = null;
+
     public function mount(string $code = null, Request $request)
     {
         $chat = \App\Models\Chat::where('code', $code)->firstOrFail();
@@ -94,8 +96,43 @@ class Chat extends Component
 
         //Cargar las conexiones de bases de datos asocidas al chat
         $this->dbConnections = $chat->databaseConnection;
+
+       // $this->validaciondearchivos();
+        $this->tipodearchivo = pathinfo($this->rutaArchivo, PATHINFO_EXTENSION);
         
         LogFacade::info('DB Connections loaded', $this->dbConnections->toArray());
+    }
+
+    protected function validaciondearchivos(){
+
+        if($this->rutaArchivo && empty($this->messages)){
+            $extension = $this->tipodearchivo;
+            $contextoAdicional = '';
+
+            if($extension === 'pdf'){
+                 $textoPDF = $this->extraerTextoPDF(storage_path('app/public/' . $this->rutaArchivo  ));
+                $this->messages = [
+                    ['role' => 'system', 
+                    'content' => "Comportamiento general:\n{$this->comportamiento}\n\nContenido del PDF:\n{$textoPDF}",]
+                ];
+                
+            } else if($extension === 'json'){
+                $jsonContent = file_get_contents(storage_path('app/public/' . $this->rutaArchivo));
+                $jsonData = json_decode($jsonContent, true);
+
+                if(json_last_error() === JSON_ERROR_NONE){
+                    $contextoAdicional = "Datos del archivo JSON: \n" .json_encode($jsonData, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+                } else {
+                    LogFacade::error('Error al decodificar el JSON: ' . json_last_error_msg());
+                    $contextoAdicional = "No se pudo procesar el archivo JSON debido a un error de formato.";
+                }   
+                $this->messages = [
+                ['role' => 'system', 
+                'content' => "Comportamiento general:\n{$this->comportamiento}\n\n{$contextoAdicional}",]
+                ];
+            }
+        }
+
     }
 
     public function extraerTextoPDF($rutaArchivo){
@@ -107,9 +144,9 @@ class Chat extends Component
 
     public function send()
     {
-        // Asegúrate de que $tts_voice está actualizado con el valor del checkbox
         $this->tts_voice = (bool) $this->tts_voice;
         $this->validate();
+        $this->validaciondearchivos();
 
         Log::create([
             'ip' => $this->log_ip,
@@ -122,57 +159,44 @@ class Chat extends Component
         ]);
 
         $currentUserMessage = $this->body;
-        $this->messages[] = ['role' => 'user', 'content' => $currentUserMessage]; //Revisar si funciona con todas las posibilidades de chats
+
+        $this->messages[] = ['role' => 'user', 'content' => $currentUserMessage];
         $this->body = '';
-        $this->is_typing = true; //Activa el indicador de escribiendo
+        $this->is_typing = true;
 
         try {
             $assistantReply = '';
 
             //Procesar preguntas al usuario con la base de datos
             $dbResponse = $this->handleDatabaseQuery($currentUserMessage);
-            //Si hay una respuesta de la base de datos, utilizarla como respuesta del chat
-            if($dbResponse !== null){
+
+            if ($dbResponse !== null) {
                 $assistantReply = $dbResponse;
                 $this->is_typing = true;
             } else {
-             // Si hay un PDF para enviar y usar
-            if ($this->rutaArchivo && empty($this->messages)) {
-                $textoPDF = $this->extraerTextoPDF(storage_path('app/public/' . $this->rutaArchivo  ));
-                // Agregamos el texto del PDF como contexto
-                $this->messages = [
-                    ['role' => 'system', 
-                    'content' => "Comportamiento general:\n{$this->comportamiento}\n\nContenido del PDF:\n{$textoPDF}",]
-                ];
+                if ($this->provider === 'openai') {
+                    $response = app('openai')->chat()->create([
+                        'model' => $this->providername,
+                        'messages' => $this->messages,
+                    ]);
 
-            }
+                    $assistantReply = $response->choices[0]->message->content ?? '';
 
-            //$this->messages[] = ['role' => 'user', 'content' => $currentUserMessage];
+                } elseif ($this->provider === 'anthropic') {
+                    $apiMessages = [];
+                    $systemPrompt = "Comportamiento general:\n{$this->comportamiento}";
+                    //dd($this->messages);
 
-            if ($this->provider === 'openai') {
+                    if (!empty($this->messages) && $this->messages[0]['role'] === 'system') {
+                        $systemPrompt = $this->messages[0]['content'];
+                        $tempMessages = $this->messages;
+                        array_shift($tempMessages);
+                        $apiMessages = $tempMessages;
+                    } else {
+                        $apiMessages = $this->messages;
+                    }
 
-                 // Si hay un PDF para enviar y usar
-                if ($this->rutaArchivo ?? false) {
-                    $textoPDF = $this->extraerTextoPDF(storage_path('app/public/' . $this->rutaArchivo  ));
-                    // Agregamos el texto del PDF como contexto
-                    $this->messages[] = ['role' => 'system', 'content' => "Contenido del PDF: " . $textoPDF];
-                }
-                
-                $response = app('openai')->chat()->create([
-                    'model' => $this->providername,
-                    'messages' => $this->messages,
-                ]);
-                $assistantReply = $response->choices[0]->message->content ?? '';
-
-                 $this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
-
-            } elseif ($this->provider === 'anthropic') {
-
-                $apiMessages = [];
-
-                if (count($this->messages) <= 2) {
-                    // Primer mensaje, incluir imagen si existe
-                    if ($this->imagen !== null) {
+                    if (count($this->messages) <= 2 && $this->imagen !== null) {
                         $imagePath = storage_path('app/public/' . $this->imagen);
 
                         if (!file_exists($imagePath)) {
@@ -182,81 +206,40 @@ class Chat extends Component
                         $imageData = base64_encode(file_get_contents($imagePath));
                         $mimeType = mime_content_type($imagePath);
 
+                        array_pop($apiMessages);
                         $apiMessages[] = [
                             'role' => 'user',
                             'content' => [
-                                [
-                                    'type' => 'text',
-                                    'text' => 'Describe esta imagen basada en su título.',
-                                ],
-                                [
-                                    'type' => 'image',
-                                    'source' => [
-                                        'type' => 'base64',
-                                        'media_type' => $mimeType,
-                                        'data' => $imageData,
-                                    ],
-                                ],
-                            ],
-                        ];
-                    } else {
-                        // Primer mensaje sin imagen
-                         // Si hay un PDF para enviar y usar
-                            if ($this->rutaArchivo ?? false) {
-                                $textoPDF = $this->extraerTextoPDF(storage_path('app/public/' . $this->rutaArchivo  ));
-                                // Agregamos el texto del PDF como contexto
-                                $this->messages[] = ['role' => 'system', 'content' => "Contenido del PDF: " . $textoPDF];
-                            }
-                        $apiMessages[] = [
-                            'role' => 'user',
-                            'content' => [
-                                [
-                                    'type' => 'text',
-                                    'text' => $currentUserMessage,
-                                ]
+                                ['type' => 'text', 'text' => $currentUserMessage],
+                                ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => $mimeType, 'data' => $imageData]],
                             ],
                         ];
                     }
+
+
+                    $anthropicPayload = [
+                        'model' => $this->providername,
+                        'max_tokens' => 1024,
+                        'messages' => $apiMessages,
+                    ];
+
+                    if (!empty($systemPrompt)) {
+                        $anthropicPayload['system'] = $systemPrompt;
+                    }
+                    LogFacade::info('Anthropic Request Payload:', $anthropicPayload);
 
                     $response = Http::withHeaders([
                         'x-api-key' => config('anthropic.key'),
                         'anthropic-version' => '2023-06-01',
                         'Content-Type' => 'application/json',
-                    ])->post('https://api.anthropic.com/v1/messages', [
-                        'model' =>'claude-3-7-sonnet-20250219',
-                        'max_tokens' => 1024,
-                        'messages' => $apiMessages,
-                        
-                    ]);
+                    ])->post('https://api.anthropic.com/v1/messages', $anthropicPayload);
 
                     $json = $response->json();
                     LogFacade::info('Anthropic response:', $json);
 
                     $assistantReply = $json['content'][0]['text'] ?? 'Sin respuesta.';
-                    
-                } else {
-                    // Mensajes posteriores sin imagen
-                    $response = Http::withHeaders([
-                        'x-api-key' => config('anthropic.key'),
-                        'anthropic-version' => '2023-06-01',
-                        'Content-Type' => 'application/json',
-                    ])->post('https://api.anthropic.com/v1/messages', [
-                        'model' => $this->providername,
-                        'messages' => [
-                            ['role' => 'user', 'content' => $currentUserMessage],
-                        ],
-                        'max_tokens' => 1000,
-                    ]);
-
-                    $json = $response->json();
-                    LogFacade::info('Respuesta Anthropic completa:', $json);
-
-                    $assistantReply = $json['completion'] ?? ($json['choices'][0]['message']['content'] ?? '');
                 }
             }
-        }
-            //array_pop($this->messages); Eliminar el último mensaje del usuario para no repetirlo
-
 
             $this->formula = $this->extraerFormulaLatex($assistantReply);
 
@@ -283,13 +266,11 @@ class Chat extends Component
 
 
         } catch (\Exception $e) {
-            LogFacade::error('Error en chat send(): ' . $e->getMessage());
-
-            array_pop($this->messages);
-            $this->messages[] = ['role' => 'assistant', 'content' => 'Se ha producido un error al procesar tu consulta. Inténtalo más tarde.'];
+            LogFacade::error('Error en send(): ' . $e->getMessage());
+            // Manejo de errores adicional si lo necesitas
         }
-
     }
+
 
     //Metodo para responder las preguntas del usuario con la base de datos
     private function handleDatabaseQuery(string $userMessage): ?string
@@ -493,14 +474,28 @@ class Chat extends Component
     private function formatSchemaForLLM(array $schema): string{
 
         $formattedSchema = "";
-
+//dd($schema);
         foreach ($schema as $item){
             //dd($item);
             if(is_array($item) && isset($item['name']) && isset($item['columns'])) {
                 //dd($item);
                 $tableName = $item['name'];
                 $columnsData  = $item['columns'];
-                //dd($tableName);
+                // Ingresar mas opciones a la estructura de la consulta 
+                /*SELECT 
+                    TABLE_NAME,
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    IS_NULLABLE,
+                    COLUMN_DEFAULT,
+                    COLUMN_KEY
+                FROM 
+                    INFORMATION_SCHEMA.COLUMNS 
+                WHERE 
+                    TABLE_SCHEMA = 'nombre_bbdd'
+                ORDER BY 
+                    TABLE_NAME, ORDINAL_POSITION;*/
+                //dd($columnsData);
                 $formattedSchema .= "Tabla: {$tableName}\n";
                 $formattedSchema .= "Columnas:\n";
 
