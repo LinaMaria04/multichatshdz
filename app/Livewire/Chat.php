@@ -167,9 +167,13 @@ class Chat extends Component
         try {
             $assistantReply = '';
 
-            //Procesar preguntas al usuario con la base de datos
-            $dbResponse = $this->handleDatabaseQuery($currentUserMessage);
-
+            if ($this->dbConnections) { // Asegura que el conector exista
+                $dbResponse = $this->handleDatabaseQuery($currentUserMessage);
+                //dd($this->dbConnections);
+            } else {
+                $dbResponse = null; // Si no hay conector, no hay respuesta de DB
+            }
+            //dd($dbResponse);
             if ($dbResponse !== null) {
                 $assistantReply = $dbResponse;
                 $this->is_typing = true;
@@ -272,41 +276,42 @@ class Chat extends Component
     }
 
 
-    //Metodo para responder las preguntas del usuario con la base de datos
-    private function handleDatabaseQuery(string $userMessage): ?string
-    {
-        //Verificar si hay una bd asociada al chat
-        if ($this->dbConnections->isEmpty()) {
-            return null;
-        }
-
-        foreach ($this->dbConnections as $dbConnection) {
-            if ($dbConnection->tipo_conector !== 'mysql') { // Si NO es 'mysql', salta a la siguiente
-                LogFacade::info("Saltando conexión DB ID {$dbConnection->id} por tipo de conector no soportado: {$dbConnection->tipo_conector}");
-                continue;
+        private function handleDatabaseQuery(string $userMessage): ?string{
+                
+            if ($this->dbConnections->isEmpty()) {
+                return null;
             }
 
-            try {
-                $connector = new DatabaseConnector(); 
-                $schema = $connector->getSchema($dbConnection);
+            foreach ($this->dbConnections as $dbConnection) {
+                if ($dbConnection->tipo_conector !== 'mysql') { // Si NO es 'mysql', salta a la siguiente
+                    LogFacade::info("Saltando conexión DB ID {$dbConnection->id} por tipo de conector no soportado: {$dbConnection->tipo_conector}");
+                    continue;
+                }
+            }    
 
-                //dd($schema); 
-                if (empty($schema)) {
-                    LogFacade::warning(("No se pudo obtener el esquema para la conexión de la base de datos: " . $dbConnection->id));
-                    continue; // Intenta seguir con la siguiente conexión en dado caso de que hayan varias
+            try {
+
+                //Obtener el esquema detallado de la base de datos
+                $connector = new DatabaseConnector(); 
+                $detailedSchema = $connector->getDetailedSchema($dbConnection);
+
+                if (empty($detailedSchema)) {
+                    LogFacade::warning("No se pudo obtener el esquema detallado para la conexión de la base de datos: " . $dbConnection->id);
+                    return null;
                 }
 
-                $schemaString = $this->formatSchemaForLLM($schema);
+                //Conivierte la pregunta del usuario a LLM
+                $schemaString = $this->formatDetailedSchemaForLLM($detailedSchema);
 
-                $promptForSQL = "Eres un asistente de IA experto en SQL. Tu tarea es generar la consulta SQL más adecuada para responder a la pregunta del usuario, basándote *únicamente* en el esquema de base de datos proporcionado. 
-                Las tablas disponibles son: {$schemaString}.
-                Genera una consulta SQL (SOLO la consulta, sin ningún texto, explicaciones, markdown, ni comentarios adicionales) para responder a la siguiente pregunta del usuario: '{$userMessage}'
-                Ejemplo de salida esperada: SELECT * FROM users;";
+                $promptForSQL = "Eres un asistente de IA experto en SQL. Tu tarea es generar la consulta SQL más adecuada para responder a la pregunta del usuario, basándote *únicamente* en el esquema de base de datos proporcionado. " .
+                "Las tablas disponibles son: {$schemaString}. " .
+                "Genera una consulta SQL (SOLO la consulta, sin ningún texto, explicaciones, markdown, ni comentarios adicionales) para responder a la siguiente pregunta del usuario: '{$userMessage}' " .
+                "Ejemplo de salida esperada: SELECT * FROM users;";
 
                 $sqlQuery = '';
                 $modelToUse = $this->providername;
 
-                if ($this->provider === 'openai') { 
+                if ($this->provider === 'openai') {
                     $sqlLlmResponse = app('openai')->chat()->create([
                         'model' => $modelToUse,
                         'messages' => [
@@ -337,14 +342,14 @@ class Chat extends Component
                         $sqlQuery = $anthropicResponse['content'][0]['text'] ?? '';
                     } else {
                         LogFacade::error("Error en la llamada a la API de Anthropic (SQL): " . $response->body());
-                        return null; 
+                        return null;
                     }
                 } else {
                     LogFacade::warning("Proveedor LLM no soportado: {$this->provider}");
                     return null;
                 }
 
-                // Limpieza de la consulta SQL generada por el LLM
+                // Limpieza de la consulta SQL generada por el LLM para obtener solo la consulta
                 if (str_starts_with(trim($sqlQuery), '```sql')) {
                     $sqlQuery = trim(str_replace(['```sql', '```'], '', $sqlQuery));
                 }
@@ -352,7 +357,7 @@ class Chat extends Component
 
                 if (!empty($sqlQuery) && $this->isValidSql($sqlQuery)) {
                     LogFacade::info("SQL generado por LLM: {$sqlQuery}");
-                    $dbResults = $connector->executeQuery($dbConnection, $sqlQuery);
+                    $dbResults = $connector->executeQuery($dbConnection, $sqlQuery); //Ejecuta la consulta y obtiene los resultados 
 
                     LogFacade::info("Resultados de la DB (raw): " . json_encode($dbResults));
 
@@ -368,10 +373,9 @@ class Chat extends Component
                         foreach ($dbResults as $row) {
                             if (is_array($row)) {
                                 foreach ($row as $key => $value) {
-                                    // Busca un valor numérico, idealmente el primero encontrado
                                     if (is_numeric($value)) {
                                         $extractedValue = $value;
-                                        break 2; // Salir de ambos bucles
+                                        break 2;
                                     }
                                 }
                             }
@@ -390,19 +394,18 @@ class Chat extends Component
                         $anthropicPromptForResponse = "La pregunta del usuario es: '{$userMessage}'. Los resultados de la base de datos obtenidos son: {$resultsString}. Responde la pregunta de forma amigable y concisa basándote en estos resultados.";
                     }
 
-                    //Limpieza adicional del prompt para Anthropic (se aplica a la cadena final)
                     $anthropicPromptForResponse = mb_convert_encoding($anthropicPromptForResponse, 'UTF-8', 'UTF-8');
                     $anthropicPromptForResponse = preg_replace('/[[:cntrl:]]/', '', $anthropicPromptForResponse);
                     $anthropicPromptForResponse = trim($anthropicPromptForResponse);
 
                     if (empty($anthropicPromptForResponse)) {
                         LogFacade::error("El prompt para Anthropic quedó vacío después de la limpieza. Revisa los caracteres en la cadena.");
-                        return null; 
+                        return null;
                     }
 
                     $finalLlmResponseContent = '';
-                    
-                    if ($this->provider === 'openai') {
+
+                   if ($this->provider === 'openai') {
                         $finalLlmResponse = app('openai')->chat()->create([
                             'model' => $modelToUse,
                             'messages' => [
@@ -414,32 +417,28 @@ class Chat extends Component
                         $finalLlmResponseContent = $finalLlmResponse->choices[0]->message->content ?? '';
 
                     } elseif ($this->provider === 'anthropic') {
-
                         $systemPromptAnthropicFinal = "Eres un asistente que responde preguntas de forma concisa y directa, utilizando la información proporcionada. NO inventes información ni menciones que no tienes acceso a la base de datos. Enfócate en responder con el dato que te doy.";
                         $systemPromptAnthropicFinal = mb_convert_encoding($systemPromptAnthropicFinal, 'UTF-8', 'UTF-8');
                         $systemPromptAnthropicFinal = preg_replace('/[[:cntrl:]]/', '', $systemPromptAnthropicFinal);
                         $systemPromptAnthropicFinal = trim($systemPromptAnthropicFinal);
 
-                        // Este es el PAYLOAD FINAL que se enviará a Anthropic
                         $finalPayloadAnthropic = [
                             'model' => $modelToUse,
-                            'system' => $systemPromptAnthropicFinal, // Usa el system prompt limpio y específico
+                            'system' => $systemPromptAnthropicFinal,
                             'messages' => [
-                                ['role' => 'user', 'content' => $anthropicPromptForResponse], // Usa el prompt de usuario limpio
+                                ['role' => 'user', 'content' => $anthropicPromptForResponse],
                             ],
                             'max_tokens' => 500,
                             'temperature' => 0.7,
                         ];
 
-                        // dd($finalPayloadAnthropic);
-
-                        LogFacade::info("Payload Final Anthropic: " . json_encode($finalPayloadAnthropic)); 
+                        LogFacade::info("Payload Final Anthropic: " . json_encode($finalPayloadAnthropic));
 
                         $response = Http::withHeaders([
                             'x-api-key' => config('anthropic.key'),
                             'anthropic-version' => '2023-06-01',
                             'Content-Type' => 'application/json',
-                        ])->post('https://api.anthropic.com/v1/messages', $finalPayloadAnthropic); 
+                        ])->post('[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)', $finalPayloadAnthropic);
 
                         if ($response->successful()) {
                             $anthropicResponse = $response->json();
@@ -449,7 +448,6 @@ class Chat extends Component
                             return null;
                         }
                     }
-                    
 
                     if (!empty($finalLlmResponseContent)) {
                         LogFacade::info("Respuesta Final de LLM: {$finalLlmResponseContent}");
@@ -457,62 +455,68 @@ class Chat extends Component
                     }
 
                     return null;
-
-                } else {
-                    LogFacade::warning("LLM generó SQL inválido o no generó SQL para la pregunta: '{$userMessage}'. SQL generado: '{$sqlQuery}'");
-                    return null;
                 }
             } catch (\Exception $e) {
                 LogFacade::error("Error en el procesamiento de DB para la pregunta '{$userMessage}': " . $e->getMessage());
-
                 return null;
             }
+            return null;
         }
-        return null; // Si no se pudo responder con ninguna conexión de BD
-    }
+    
+        private function formatDetailedSchemaForLLM(array $detailedSchemaData): string{
 
-    private function formatSchemaForLLM(array $schema): string{
+            $formattedSchema = []; // Arrgelo para construir las líneas de texto
 
-        $formattedSchema = "";
-//dd($schema);
-        foreach ($schema as $item){
-            //dd($item);
-            if(is_array($item) && isset($item['name']) && isset($item['columns'])) {
-                //dd($item);
-                $tableName = $item['name'];
-                $columnsData  = $item['columns'];
-                // Ingresar mas opciones a la estructura de la consulta 
-                /*SELECT 
-                    TABLE_NAME,
-                    COLUMN_NAME,
-                    DATA_TYPE,
-                    IS_NULLABLE,
-                    COLUMN_DEFAULT,
-                    COLUMN_KEY
-                FROM 
-                    INFORMATION_SCHEMA.COLUMNS 
-                WHERE 
-                    TABLE_SCHEMA = 'nombre_bbdd'
-                ORDER BY 
-                    TABLE_NAME, ORDINAL_POSITION;*/
-                //dd($columnsData);
-                $formattedSchema .= "Tabla: {$tableName}\n";
-                $formattedSchema .= "Columnas:\n";
+            foreach ($detailedSchemaData as $tableName => $columnsInfo) {
+                // Añadir el nombre de la tabla
+                $formattedSchema[] = "Tabla: `{$tableName}`";
+                $formattedSchema[] = "Campos:";
 
-                if (is_array($columnsData)) { // Asegurarse de que $columnsData es un array
-                    foreach ($columnsData as $column) {
-                        // Asegúrate de que cada $column sea un array y contenga la clave 'name'
-                        if (is_array($column) && isset($column['name'])) {
-                            $columnType = $column['type'] ?? 'VARCHAR'; // Asume VARCHAR si no hay tipo
-                            $formattedSchema .= "  - {$column['name']} ({$columnType})\n";
-                        }
+                // Iterar sobre las columnas de la tabla actual
+                foreach ($columnsInfo as $columnName => $columnDetails) {
+                    $type = $columnDetails['type'] ?? 'VARCHAR'; 
+                    $nullable = ($columnDetails['nullable'] ?? 'YES') === 'YES' ? 'NULL' : 'NOT NULL';
+                    $key = $columnDetails['key'] ?? '';
+                    $length = $columnDetails['length'] ?? null; 
+                    $default = $columnDetails['default'] ?? null; 
+                    $extra = $columnDetails['extra'] ?? null; 
+                    $comment = $columnDetails['comment'] ?? null; 
+
+                    // Construir la cadena de detalles de la columna
+                    $columnString = "  - `{$columnName}` ({$type}";
+
+                    if ($length !== null) {
+                        $columnString .= "({$length})";
                     }
+                    if (!empty($key) && $key === 'PRI') {
+                        $columnString .= " PK";
+                    } elseif (!empty($key) && $key === 'UNI') {
+                        $columnString .= " UNIQUE";
+                    } elseif (!empty($key) && $key === 'MUL') {
+                    }
+
+                    if ($nullable === 'NOT NULL') { 
+                        $columnString .= " NOT NULL";
+                    }
+                    if ($default !== null) {
+                        $columnString .= " DEFAULT '" . addslashes($default) . "'"; 
+                    }
+                    if (!empty($extra)) {
+                        $columnString .= " {$extra}";
+                    }
+                    $columnString .= ")";
+
+                    if (!empty($comment)) {
+                        $columnString .= " // {$comment}";
+                    }
+
+                    $formattedSchema[] = $columnString;
                 }
-                $formattedSchema .= "\n";
+                $formattedSchema[] = ""; // Línea en blanco para separar tablas visualmente
             }
+
+            return implode("\n", $formattedSchema);
         }
-        return $formattedSchema;
-    }
 
     private function isValidSql(string $sql): bool{
         // Convertir la consulta a minúsculas para una comparación insensible a mayúsculas/minúsculas
