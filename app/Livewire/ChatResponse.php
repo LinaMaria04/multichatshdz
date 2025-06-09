@@ -135,6 +135,7 @@ class ChatResponse extends Component
 
 
                 $content = '';
+                $fullResponse = '';
                 foreach ($stream as $response) {
 
                     ray($response->event);
@@ -149,14 +150,16 @@ class ChatResponse extends Component
 
                         $content = Arr::get($response->response->delta->content[0]->toArray(), 'text.value');
 
+                        $fullResponse .= $content;
+
                         $this->response .= $content;
                     }
 
-                    $this->stream(
+                    /*$this->stream(
                         to: 'stream-' . $this->getId(),
                         content: $content,
                         replace: false
-                    );
+                    );*/
 
                 }
 

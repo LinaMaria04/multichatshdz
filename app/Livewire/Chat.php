@@ -438,7 +438,7 @@ class Chat extends Component
                             'x-api-key' => config('anthropic.key'),
                             'anthropic-version' => '2023-06-01',
                             'Content-Type' => 'application/json',
-                        ])->post('[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)', $finalPayloadAnthropic);
+                        ])->post('https://api.anthropic.com/v1/messages', $finalPayloadAnthropic);
 
                         if ($response->successful()) {
                             $anthropicResponse = $response->json();
