@@ -10,7 +10,7 @@
         </div>
 
         {{-- Stream container --}}
-        <div  class="stream">
+        <div wire:stream="stream-{{ $this->getId() }}" class="stream">
             {{-- Add a wrapper with stream-content class only if $response is not empty --}}
            {{--@if(!empty($response))--}}
            @if(!empty($assistantReply))
