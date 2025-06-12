@@ -16,6 +16,8 @@ use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Support\Facades\Storage;
 use Filament\Notifications\Notification;
 use Illuminate\Support\HtmlString;
+use Illuminate\Support\Facades\Http; 
+use Illuminate\Support\Facades\Log as LogFacade; 
 
 class FilesRelationManager extends RelationManager
 {
@@ -25,26 +27,6 @@ class FilesRelationManager extends RelationManager
     protected static string $relationship = 'files';
 
     protected static ?string $title = 'Archivos';
-
-    public function getResourceTable(): string
-    {
-        $currentCount = $this->getOwnerRecord()->files()->count();
-        $maxFiles = self::MAX_FILES_PER_CHAT;
-        $remainingSlots = $maxFiles - $currentCount;
-
-        // Continúa con la renderización normal de la tabla
-        return parent::getResourceTable();
-    }
-
-    public function getTableHeaderViewData(): array
-    {
-        $currentCount = $this->getOwnerRecord()->files()->count();
-        $maxFiles = self::MAX_FILES_PER_CHAT;
-        $remainingSlots = $maxFiles - $currentCount;
-        return [
-            'remainingFiles' => $remainingSlots,
-        ];
-    }
 
     public function form(Form $form): Form
     {
@@ -57,10 +39,8 @@ class FilesRelationManager extends RelationManager
                     ->maxSize(100 * 1024) // 100MB en kilobytes
                     ->acceptedFileTypes([
                         'application/pdf',
-                        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                        'application/msword',
+                        // 'application/msword', // Se enviarán como binarios, Python los manejará
                         'text/plain',
-                        'application/zip',
                         'application/json'
                     ])
                     ->directory(function(RelationManager $livewire) {
@@ -149,47 +129,128 @@ class FilesRelationManager extends RelationManager
                             throw new \Exception('No se han seleccionado archivos');
                         }
                         
-                        // Crear registros para cada archivo subido
                         $firstFile = null;
+                        $chat = $livewire->getOwnerRecord(); // Obtener la instancia del Chat
+                        $pythonApiUrl = env('PYTHON_API_URL'); // Obtener la URL de la API de Python
+
+                        // Obtener el vectorstore_id del chat
+                        $vectorstoreId = $chat->vectorstore_id;
+
+                        $vectorstoreId  = str_replace('_', '-', $vectorstoreId);
+
+                        //CREAR EL ÍNDICE EN PINECONE SI NO EXISTE
+                        if (empty($vectorstoreId)) {
+                            Notification::make()
+                                ->title('Error: El chat no tiene un ID de vector store asociado.')
+                                ->danger()
+                                ->send();
+                            LogFacade::error('Error: vectorstore_id no está disponible para el chat ' . $chat->id);
+                            throw new \Exception('ID de vector store no disponible.');
+                        }
+
+                        try {
+                             $createIndexResponse = Http::withHeaders([
+                                'Content-Type' => 'application/json',
+                                'Accept' => 'application/json',
+                            ])->post("{$pythonApiUrl}/create_pinecone_index", [
+                                'index_name' => $vectorstoreId ,
+                                'dimension' => 1024,
+                                'metric' => 'cosine'
+                            ]);
+
+                            if (!$createIndexResponse->successful()) {
+                                $errorDetail = $createIndexResponse->json('detail') ?? $createIndexResponse->body();
+                                Notification::make()
+                                    ->title('Error al crear el índice de Pinecone.')
+                                    ->body("Detalles: " . (is_array($errorDetail) ? json_encode($errorDetail) : $errorDetail))
+                                    ->danger()
+                                    ->send();
+                                LogFacade::error("Error al crear índice Pinecone para '{$vectorstoreId}': " . $createIndexResponse->body());
+                                throw new \Exception('Fallo al crear el índice de Pinecone.');
+                            } else {
+                                LogFacade::info("Índice Pinecone para '{$vectorstoreId}' (re)confirmado: " . $createIndexResponse->body());
+                            }
+                        } catch (\Exception $e) {
+                            Notification::make()
+                                ->title('Excepción al preparar el índice de Pinecone.')
+                                ->body("Error: " . $e->getMessage())
+                                ->danger()
+                                ->send();
+                            LogFacade::error("Excepción al crear/verificar índice Pinecone para '{$vectorstoreId}': " . $e->getMessage());
+                            throw $e; // Re-lanza para que Filament sepa que la acción falló
+                        }
                         
+                        //Procesar cada archivo para ingesta en Pinecone 
                         foreach ($data['filename'] as $index => $filename) {
-                            $file = $livewire->getOwnerRecord()->files()->create([
+                            $file = $chat->files()->create([
                                 'filename' => $filename,
                                 'filename_description' => $data['filename_description'] ?? null,
                                 'description' => $data['description'] ?? null,
-                                'file_id' => null, // Este campo se actualizará después si es necesario
+                                'file_id' => null, // Este campo ya no se usará para OpenAI Files, sino para tu propio ID si lo necesitas
                             ]);
                             
-                            // Subir el archivo a OpenAI y asociarlo al VectorStore
+                            $filePath = Storage::disk('public')->path($filename);
+                            $fileMimeType = mime_content_type($filePath);
+
+                            // Definir los tipos de archivos soportados por la API de Python para procesamiento
+                            $supportedMimeTypes = [
+                                'application/pdf',
+                                'text/plain',
+                                'application/json',
+                                'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
+                                'application/msword', // .doc
+                                'application/zip', // .zip
+                            ];
+
+                            if (!in_array($fileMimeType, $supportedMimeTypes)) {
+                                Notification::make()
+                                    ->title('Tipo de archivo no soportado para ingesta.')
+                                    ->body("El tipo '{$fileMimeType}' para '{$filename}' no es soportado. Contacta a soporte si necesitas este tipo de archivo.")
+                                    ->danger()
+                                    ->send();
+                                LogFacade::warning("Tipo de archivo '{$fileMimeType}' no soportado para ingesta directa en Pinecone: {$filename}");
+                                continue; 
+                            }
+
                             try {
-                                $client = app('openai');
-                                $chat = $livewire->getOwnerRecord();
-                                
-                                // 1. Subir el archivo a OpenAI
-                                $filePath = Storage::disk('public')->path($filename);
-                                $uploadedFile = $client->files()->upload([
-                                    'file' => fopen($filePath, 'r'),
-                                    'purpose' => 'assistants',
+                                $fileContent = file_get_contents($filePath);
+
+                                $ingestResponse = Http::attach(
+                                    'file', // Nombre del campo del formulario en Python
+                                    $fileContent,
+                                    basename($filePath), // Nombre original del archivo para la API
+                                    ['Content-Type' => $fileMimeType] // Tipo de archivo
+                                )->post("{$pythonApiUrl}/ingest_file", [ 
+                                    'document_id' => 'file-' . $file->id, 
+                                    'metadata_json' => json_encode([ 
+                                        'source' => basename($filename),
+                                        'chat_id' => $chat->id,
+                                        'chat_code' => $chat->code,
+                                        'type' => $fileMimeType,
+                                        'filename_description' => $data['filename_description'] ?? null,
+                                        'description' => $data['description'] ?? null,
+                                    ]),
+                                    'vectorstore_id' => $vectorstoreId, // El ID del vectorstore
                                 ]);
-                                
-                                // 2. Asociar el archivo al VectorStore
-                                if ($chat->vectorstore_id) {
-                                    $client->vectorStores()->files()->create(
-                                        vectorStoreId: $chat->vectorstore_id,
-                                        parameters: [
-                                            'file_id' => $uploadedFile->id,
-                                        ]
-                                    );
+
+                                if ($ingestResponse->successful()) {
+                                    LogFacade::info("Archivo '{$filename}' (ID: {$file->id}) enviado a Python para ingesta exitosamente (índice: {$vectorstoreId}). Respuesta: " . $ingestResponse->body());
+                                } else {
+                                    $errorDetail = $ingestResponse->json() ?? $ingestResponse->body();
+                                    Notification::make()
+                                        ->title("Error al ingestar '{$filename}' en Pinecone (vía Python).")
+                                        ->body("Detalles: " . (is_array($errorDetail) ? json_encode($errorDetail) : $errorDetail))
+                                        ->danger()
+                                        ->send();
+                                    LogFacade::error("Error al ingestar archivo '{$filename}' en Pinecone (índice: {$vectorstoreId}): " . $ingestResponse->body());
                                 }
-                                
-                                // 3. Actualizar el registro con el ID del archivo
-                                $file->update([
-                                    'file_id' => $uploadedFile->id
-                                ]);
-                                
                             } catch (\Exception $e) {
-                                // Registrar el error pero continuar con el proceso
-                                \Log::error('Error al subir archivo a OpenAI: ' . $e->getMessage());
+                                Notification::make()
+                                    ->title("Excepción al enviar '{$filename}' a la API de Python.")
+                                    ->body("Error: " . $e->getMessage())
+                                    ->danger()
+                                    ->send();
+                                LogFacade::error("Excepción al enviar archivo '{$filename}' a API de Python: " . $e->getMessage());
                             }
                             
                             // Guardar referencia al primer archivo para devolverlo
@@ -198,7 +259,6 @@ class FilesRelationManager extends RelationManager
                             }
                         }
                         
-                        // Devolver el primer archivo creado (requerido por Filament)
                         return $firstFile;
                     })
             ])
@@ -206,21 +266,10 @@ class FilesRelationManager extends RelationManager
                 //
             ])
             ->actions([
-                Tables\Actions\ViewAction::make()
-                    ->modalContent(fn (Files $record) => view('filament.tables.actions.pdf-preview-modal', [
-                        'fileUrl' => \Storage::disk('public')->url($record->filename),
-                        'isPdf' => str_ends_with(strtolower($record->filename), '.pdf'),
-                    ])),
                 Tables\Actions\DeleteAction::make()
                     ->before(function (DeleteAction $action, Files $file) {
                         ray('Vamos a eliminar del servidorel archivo: ' . $file->filename);
-                        \Storage::disk('public')->delete($file->filename);
-                        $client = app('openai');
-                        // Solo intentar eliminar el archivo de OpenAI si file_id no es null
-                        if (!empty($file->file_id)) {
-                            ray('Vamos a eliminar de OpenAI el archivo: ' . $file->file_id);
-                            $client->files()->delete($file->file_id);
-                        }
+                        Storage::disk('public')->delete($file->filename);
                     })
             ])
             ->bulkActions([
@@ -229,12 +278,6 @@ class FilesRelationManager extends RelationManager
                         ->before(function (Tables\Actions\DeleteBulkAction $action, \Illuminate\Database\Eloquent\Collection $records) {
                             foreach ($records as $record) {
                                 Storage::disk('public')->delete($record->filename);
-
-                                $client = app('openai');
-                                // Solo intentar eliminar el archivo de OpenAI si file_id no es null
-                                if (!empty($record->file_id)) {
-                                    $client->files()->delete($record->file_id);
-                                }
                             }
                         }),
                 ]),

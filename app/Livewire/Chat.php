@@ -63,6 +63,10 @@ class Chat extends Component
 
     public $tipodearchivo = null;
 
+    public $vectorstoreId = null;
+
+    protected string $pythonApiUrl = 'http://localhost:8001';
+
     public function mount(string $code = null, Request $request)
     {
         $chat = \App\Models\Chat::where('code', $code)->firstOrFail();
@@ -86,6 +90,8 @@ class Chat extends Component
         $this->provider = $chat->provider;
         $this->providername = $chat->providername;
 
+        $this->vectorstoreId = $chat->vectorstore_id;
+
         $firstImagen = $chat->imagen()->select('path')->first();
         $this->imagen = $firstImagen ? $firstImagen['path'] : null;
 
@@ -97,13 +103,12 @@ class Chat extends Component
         //Cargar las conexiones de bases de datos asocidas al chat
         $this->dbConnections = $chat->databaseConnection;
 
-       // $this->validaciondearchivos();
         $this->tipodearchivo = pathinfo($this->rutaArchivo, PATHINFO_EXTENSION);
         
         LogFacade::info('DB Connections loaded', $this->dbConnections->toArray());
     }
 
-    protected function validaciondearchivos(){
+    /*protected function validaciondearchivos(){
 
         if($this->rutaArchivo && empty($this->messages)){
             $extension = $this->tipodearchivo;
@@ -133,20 +138,19 @@ class Chat extends Component
             }
         }
 
-    }
+    }*/
 
-    public function extraerTextoPDF($rutaArchivo){
+    /*public function extraerTextoPDF($rutaArchivo){
         $parser = new Parser();
         $pdf = $parser->parseFile($rutaArchivo);
         $texto = $pdf->getText();
         return $texto;
-    }
+    }*/
 
     public function send()
     {
         $this->tts_voice = (bool) $this->tts_voice;
         $this->validate();
-        $this->validaciondearchivos();
 
         Log::create([
             'ip' => $this->log_ip,
@@ -169,28 +173,54 @@ class Chat extends Component
 
             if ($this->dbConnections) { // Asegura que el conector exista
                 $dbResponse = $this->handleDatabaseQuery($currentUserMessage);
-                //dd($this->dbConnections);
+                
             } else {
                 $dbResponse = null; // Si no hay conector, no hay respuesta de DB
             }
-            //dd($dbResponse);
-            if ($dbResponse !== null) {
-                $assistantReply = $dbResponse;
-                $this->is_typing = true;
-            } else {
+
+           $vectorstoreId = $this->vectorstoreId;
+                LogFacade::info('DEBUG Laravel: Vectorstore ID ANTES de str_replace: ' . $vectorstoreId); // <-- Añade esta línea
+                $vectorstoreId = str_replace('_', '-', $vectorstoreId);
+                LogFacade::info('DEBUG Laravel: Vectorstore ID DESPUÉS de str_replace: ' . $vectorstoreId); // <-- Y esta línea
+
+            if (empty($assistantReply)) { // Solo si no obtuvimos respuesta de la DB
+                try {
+                    $response = Http::post("{$this->pythonApiUrl}/ask_chatbot", [
+                        'question' => $currentUserMessage,
+                        'comportamiento_chat' => $this->comportamiento, 
+                        'vectorstore_id' => $vectorstoreId,
+
+                    ]);
+
+                    if ($response->successful()) {
+                        $pythonResponse = $response->json();
+                        $assistantReply = $pythonResponse['response'] ?? 'Lo siento, no pude generar una respuesta desde la API de Python.';
+                        LogFacade::info('Respuesta de API Python:', ['response' => $assistantReply]);
+                    } else {
+                        $statusCode = $response->status();
+                        $errorMessage = $response->body();
+                        LogFacade::error("Error en la llamada a la API de Python: Status {$statusCode}, Error: {$errorMessage}");
+                        $assistantReply = 'Lo siento, hubo un problema al conectar con el cerebro del bot. Intenta de nuevo más tarde.';
+                    }
+                } catch (\Exception $e) {
+                    LogFacade::error('Excepción al llamar a la API de Python: ' . $e->getMessage());
+                    $assistantReply = 'Ocurrió un error inesperado al procesar tu solicitud.';
+                }
+            }
+
+            //Si aún no hay respuesta (ni de DB, ni de la API Python), fallback a un LLM directo            
+            if (empty($assistantReply)) {
+                LogFacade::info('No se obtuvo respuesta de DB ni API Python. Intentando con LLM directo.');
                 if ($this->provider === 'openai') {
                     $response = app('openai')->chat()->create([
                         'model' => $this->providername,
-                        'messages' => $this->messages,
+                        'messages' => $this->messages, // Usa el historial completo
                     ]);
-
                     $assistantReply = $response->choices[0]->message->content ?? '';
-
                 } elseif ($this->provider === 'anthropic') {
                     $apiMessages = [];
                     $systemPrompt = "Comportamiento general:\n{$this->comportamiento}";
-                    //dd($this->messages);
-
+                    
                     if (!empty($this->messages) && $this->messages[0]['role'] === 'system') {
                         $systemPrompt = $this->messages[0]['content'];
                         $tempMessages = $this->messages;
@@ -200,37 +230,34 @@ class Chat extends Component
                         $apiMessages = $this->messages;
                     }
 
+                    // Lógica para manejar imágenes con Anthropic si es tu primer mensaje y tienes imagen
                     if (count($this->messages) <= 2 && $this->imagen !== null) {
                         $imagePath = storage_path('app/public/' . $this->imagen);
-
-                        if (!file_exists($imagePath)) {
-                            throw new \Exception("La imagen no existe: $imagePath");
+                        if (file_exists($imagePath)) {
+                            $imageData = base64_encode(file_get_contents($imagePath));
+                            $mimeType = mime_content_type($imagePath);
+                            array_pop($apiMessages); // Remove last user message
+                            $apiMessages[] = [
+                                'role' => 'user',
+                                'content' => [
+                                    ['type' => 'text', 'text' => $currentUserMessage],
+                                    ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => $mimeType, 'data' => $imageData]],
+                                ],
+                            ];
+                        } else {
+                            LogFacade::warning("La imagen no existe para Anthropic: $imagePath");
                         }
-
-                        $imageData = base64_encode(file_get_contents($imagePath));
-                        $mimeType = mime_content_type($imagePath);
-
-                        array_pop($apiMessages);
-                        $apiMessages[] = [
-                            'role' => 'user',
-                            'content' => [
-                                ['type' => 'text', 'text' => $currentUserMessage],
-                                ['type' => 'image', 'source' => ['type' => 'base64', 'media_type' => $mimeType, 'data' => $imageData]],
-                            ],
-                        ];
                     }
-
 
                     $anthropicPayload = [
                         'model' => $this->providername,
                         'max_tokens' => 1024,
                         'messages' => $apiMessages,
                     ];
-
                     if (!empty($systemPrompt)) {
                         $anthropicPayload['system'] = $systemPrompt;
                     }
-                    LogFacade::info('Anthropic Request Payload:', $anthropicPayload);
+                    LogFacade::info('Anthropic Request Payload (fallback):', $anthropicPayload);
 
                     $response = Http::withHeaders([
                         'x-api-key' => config('anthropic.key'),
@@ -239,40 +266,45 @@ class Chat extends Component
                     ])->post('https://api.anthropic.com/v1/messages', $anthropicPayload);
 
                     $json = $response->json();
-                    LogFacade::info('Anthropic response:', $json);
-
+                    LogFacade::info('Anthropic response (fallback):', $json);
                     $assistantReply = $json['content'][0]['text'] ?? 'Sin respuesta.';
                 }
             }
 
+
             $this->formula = $this->extraerFormulaLatex($assistantReply);
 
             if ($this->formula) {
-                // Quitar fórmula del texto para no repetirla en el mensaje
                 $cleanText = preg_replace('/(\$\$.*?\$\$|\\\(.*?\\\))/s', '', $assistantReply);
                 $cleanText = trim($cleanText);
-
-                // Agregar solo el texto limpio al chat
                 $this->messages[] = ['role' => 'assistant', 'content' => $cleanText];
             } else {
                 $this->formula = null;
                 $this->messages[] = ['role' => 'assistant', 'content' => $assistantReply];
             }
 
-            // Resetear uso de fórmula en caso que hubiera
             $this->usarFormula = false;
-
             $this->dispatch('formulaActualizada');
-
             $this->formtemp = $this->usarFormula($this->formula);
 
-        //dd( $this->extraerFormulaLatex($assistantReply));
-
-
         } catch (\Exception $e) {
-            LogFacade::error('Error en send(): ' . $e->getMessage());
-            // Manejo de errores adicional si lo necesitas
+            LogFacade::error('Error general en send(): ' . $e->getMessage());
+            $this->messages[] = ['role' => 'assistant', 'content' => 'Lo siento, ocurrió un error inesperado. Por favor, inténtalo de nuevo.'];
+        } finally {
+            $this->is_typing = false;
         }
+
+        // Log the assistant's reply
+        Log::create([
+            'ip' => $this->log_ip,
+            'url' => $this->url,
+            'user_agent' => $this->user_agent,
+            'agent_code' => $this->code,
+            'role' => 'assistant',
+            'content' => $assistantReply,
+            'timestamp' => now()
+        ]);
+
     }
 
 

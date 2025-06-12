@@ -36,6 +36,8 @@ class CreateChat extends CreateRecord
 
                 $client = app('openai');
 
+                $code = str_replace('_', '-', $this->data['code']);
+
                 // Create an Vector Store
                 $response_vectorstore = $client->vectorStores()->create([
                     'name' => 'eim-' . $this->data['code'],
