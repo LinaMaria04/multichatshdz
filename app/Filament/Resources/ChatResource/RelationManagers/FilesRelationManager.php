@@ -18,6 +18,7 @@ use Filament\Notifications\Notification;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\Facades\Http; 
 use Illuminate\Support\Facades\Log as LogFacade; 
+use Illuminate\Support\Facades\Auth;
 
 class FilesRelationManager extends RelationManager
 {
@@ -133,15 +134,21 @@ class FilesRelationManager extends RelationManager
                         $chat = $livewire->getOwnerRecord(); // Obtener la instancia del Chat
                         $pythonApiUrl = env('PYTHON_API_URL'); // Obtener la URL de la API de Python
 
-                        // Obtener el vectorstore_id del chat
-                        $vectorstoreId = $chat->vectorstore_id;
+                        //Obetener el ID del usuario loguedo, mas adelante se deberá de cambiar por el cliente o la empresa
+                        $user = Auth::user();
+                        $userId = $user->id;
 
-                        $vectorstoreId  = str_replace('_', '-', $vectorstoreId);
+                        // Obtener el vectorstore_id del chat
+                        //$vectorstoreId = $chat->vectorstore_id;
+
+                        //$vectorstoreId  = str_replace('_', '-', $vectorstoreId);
+
+                        $userIndexName = 'user-index-' . $userId;
 
                         //CREAR EL ÍNDICE EN PINECONE SI NO EXISTE
-                        if (empty($vectorstoreId)) {
+                        if (empty($userIndexName)) {
                             Notification::make()
-                                ->title('Error: El chat no tiene un ID de vector store asociado.')
+                                ->title('Error: El usuario no tiene un ID de vector store asociado.')
                                 ->danger()
                                 ->send();
                             LogFacade::error('Error: vectorstore_id no está disponible para el chat ' . $chat->id);
@@ -153,8 +160,8 @@ class FilesRelationManager extends RelationManager
                                 'Content-Type' => 'application/json',
                                 'Accept' => 'application/json',
                             ])->post("{$pythonApiUrl}/create_pinecone_index", [
-                                'index_name' => $vectorstoreId ,
-                                'dimension' => 1024,
+                                'index_name' => $userIndexName ,
+                                'dimension' => 384,
                                 'metric' => 'cosine'
                             ]);
 
@@ -165,10 +172,10 @@ class FilesRelationManager extends RelationManager
                                     ->body("Detalles: " . (is_array($errorDetail) ? json_encode($errorDetail) : $errorDetail))
                                     ->danger()
                                     ->send();
-                                LogFacade::error("Error al crear índice Pinecone para '{$vectorstoreId}': " . $createIndexResponse->body());
+                                LogFacade::error("Error al crear índice Pinecone para '{$userIndexName}': " . $createIndexResponse->body());
                                 throw new \Exception('Fallo al crear el índice de Pinecone.');
                             } else {
-                                LogFacade::info("Índice Pinecone para '{$vectorstoreId}' (re)confirmado: " . $createIndexResponse->body());
+                                LogFacade::info("Índice Pinecone para '{$userIndexName}' (re)confirmado: " . $createIndexResponse->body());
                             }
                         } catch (\Exception $e) {
                             Notification::make()
@@ -176,7 +183,7 @@ class FilesRelationManager extends RelationManager
                                 ->body("Error: " . $e->getMessage())
                                 ->danger()
                                 ->send();
-                            LogFacade::error("Excepción al crear/verificar índice Pinecone para '{$vectorstoreId}': " . $e->getMessage());
+                            LogFacade::error("Excepción al crear/verificar índice Pinecone para '{$userIndexName}': " . $e->getMessage());
                             throw $e; // Re-lanza para que Filament sepa que la acción falló
                         }
                         
@@ -224,17 +231,19 @@ class FilesRelationManager extends RelationManager
                                     'document_id' => 'file-' . $file->id, 
                                     'metadata_json' => json_encode([ 
                                         'source' => basename($filename),
-                                        'chat_id' => $chat->id,
+                                        'user_id' => $userId,
+                                        //'chat_id' => $chat->id,
                                         'chat_code' => $chat->code,
                                         'type' => $fileMimeType,
                                         'filename_description' => $data['filename_description'] ?? null,
                                         'description' => $data['description'] ?? null,
                                     ]),
-                                    'vectorstore_id' => $vectorstoreId, // El ID del vectorstore
+                                    'vectorstore_id' => $userIndexName, // El ID del vectorstore
+                                    'chat_id' => $chat->id, 
                                 ]);
 
                                 if ($ingestResponse->successful()) {
-                                    LogFacade::info("Archivo '{$filename}' (ID: {$file->id}) enviado a Python para ingesta exitosamente (índice: {$vectorstoreId}). Respuesta: " . $ingestResponse->body());
+                                    LogFacade::info("Archivo '{$filename}' (ID: {$file->id}) enviado a Python para ingesta exitosamente (índice: {$userIndexName}). Respuesta: " . $ingestResponse->body());
                                 } else {
                                     $errorDetail = $ingestResponse->json() ?? $ingestResponse->body();
                                     Notification::make()
@@ -242,7 +251,7 @@ class FilesRelationManager extends RelationManager
                                         ->body("Detalles: " . (is_array($errorDetail) ? json_encode($errorDetail) : $errorDetail))
                                         ->danger()
                                         ->send();
-                                    LogFacade::error("Error al ingestar archivo '{$filename}' en Pinecone (índice: {$vectorstoreId}): " . $ingestResponse->body());
+                                    LogFacade::error("Error al ingestar archivo '{$filename}' en Pinecone (índice: {$userIndexName}): " . $ingestResponse->body());
                                 }
                             } catch (\Exception $e) {
                                 Notification::make()

@@ -13,6 +13,7 @@ use Illuminate\Support\Facades\Http;
 use Smalot\PdfParser\Parser;
 use Illuminate\Support\Facades\Log as LogFacade;
 use OpenAI\Laravel\Facades\OpenAI;
+use Illuminate\Support\Facades\Auth;
 
 class Chat extends Component
 {
@@ -50,6 +51,8 @@ class Chat extends Component
 
     public $imagen;
 
+    public $chat;
+
     public $rutaArchivo;
 
     public $comportamiento;
@@ -72,6 +75,8 @@ class Chat extends Component
         $chat = \App\Models\Chat::where('code', $code)->firstOrFail();
 
         LogFacade::info('Chat data', $chat->toArray());
+
+        $this->chat = $chat;
 
         $this->code = $code;
 
@@ -178,17 +183,27 @@ class Chat extends Component
                 $dbResponse = null; // Si no hay conector, no hay respuesta de DB
             }
 
-           $vectorstoreId = $this->vectorstoreId;
-                LogFacade::info('DEBUG Laravel: Vectorstore ID ANTES de str_replace: ' . $vectorstoreId); // <-- Añade esta línea
-                $vectorstoreId = str_replace('_', '-', $vectorstoreId);
-                LogFacade::info('DEBUG Laravel: Vectorstore ID DESPUÉS de str_replace: ' . $vectorstoreId); // <-- Y esta línea
+           #$vectorstoreId = $this->vectorstoreId;
+            #    LogFacade::info('DEBUG Laravel: Vectorstore ID ANTES de str_replace: ' . $vectorstoreId); // <-- Añade esta línea
+             #   $vectorstoreId = str_replace('_', '-', $vectorstoreId);
+              #  LogFacade::info('DEBUG Laravel: Vectorstore ID DESPUÉS de str_replace: ' . $vectorstoreId); // <-- Y esta línea
+            
+            $userId = Auth::id();
+            $userIndexName = 'user-index-' . str_replace('_', '-', (string)$userId);
+
+            $chatId = $this->chat->id;
+           // $chatIdAsString = (string)$chatId;
+
+            LogFacade::info('DEBUG Laravel: userIndexName para Pinecone: ' . $userIndexName);
+            LogFacade::info('DEBUG Laravel: chat_id para filtro: ' . $chatId);
 
             if (empty($assistantReply)) { // Solo si no obtuvimos respuesta de la DB
                 try {
                     $response = Http::post("{$this->pythonApiUrl}/ask_chatbot", [
                         'question' => $currentUserMessage,
                         'comportamiento_chat' => $this->comportamiento, 
-                        'vectorstore_id' => $vectorstoreId,
+                        'vectorstore_id' => $userIndexName,
+                        'chat_id' => $chatId,
 
                     ]);
 
